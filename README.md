@@ -6,6 +6,8 @@ The pilot leads moving targets, alternates gun fire with laser charging, estimat
 
 The pilot remembers recent attackers and weapon pickups, prioritizes finishing exposed opponents, and uses terrain to break contact when outmatched. It can use its jets to reach a roof with a clear firing lane, and abandons the climb when the zone or threats make it unsafe.
 
+The close-range build aims the gun inside lightning's wider cone, so both weapons can fire on a moving opponent. It uses short windows to break weapon crates before opponents close in and prioritizes groups of dropped cubes after a kill.
+
 ```sh
 docker build --platform linux/amd64 -t oval-vector .
 ```

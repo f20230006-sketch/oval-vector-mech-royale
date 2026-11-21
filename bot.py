@@ -12,7 +12,7 @@ from mechfight import run
 
 
 TAU = math.tau
-PICKUP_VALUES = {"gun": 0, "mortar": 1, "lightning": 3, "laser": 5}
+PICKUP_VALUES = {"gun": 0, "mortar": 2, "laser": 4, "lightning": 5}
 UPGRADE_VALUES = {
     "laser_charge": 12, "laser_damage": 11, "nanites": 11, "plating": 10,
     "armor": 9, "servos": 8.5, "gun_mag": 8, "gun_damage": 7.5,
@@ -473,6 +473,11 @@ class Pilot:
         effective_range = max((
             weapon["stats"].get("range", 150) for weapon in me["weapons"] if weapon
         ), default=0)
+        arming = any(weapon is None for weapon in me["weapons"]) and self.pressure < 105
+        enemy_nearby = any(
+            enemy["kind"] == "mech" and distance(position, enemy["pos"]) < 60
+            for enemy in obs["mechs"]
+        )
         rivals = []
         for enemy in obs["mechs"]:
             dist = distance(position, enemy["pos"])
@@ -503,7 +508,10 @@ class Pilot:
         for crate in obs["crates"]:
             dist = distance(position, crate["pos"])
             if dist < 125:
-                rivals.append((41 - .28 * dist + (300 - crate["hp"]) * .025, crate))
+                score = 41 - .28 * dist + (300 - crate["hp"]) * .025
+                if arming and not enemy_nearby and dist < 42:
+                    score += 26
+                rivals.append((score, crate))
         rivals.sort(key=lambda pair: -pair[0])
         hidden = None
         for _, enemy in rivals[:8]:
@@ -519,7 +527,7 @@ class Pilot:
         kind = enemy.get("kind")
         if kind == "mech":
             cubes = self.config["cubes"]
-            growth = cubes["size_per_cube"] * min(cubes["stat_cap"], enemy.get("cubes", 0))
+            growth = cubes["size_per_cube"] * enemy.get("cubes", 0)
             return self.config["mech"]["height"] * .56 * (1 + growth)
         if kind == "npc":
             return self.config["npc"]["height"] * .51
@@ -530,7 +538,12 @@ class Pilot:
         stats, position = weapon["stats"], me["pos"]
         mortar = kind == "mortar"
         height = me["stats"]["height"] + .5 if mortar else me["stats"]["muzzle_height"]
-        origin = position[0], position[1], position[2] + height
+        shooter_velocity = me.get("vel", (0, 0, 0))
+        origin = (
+            position[0] + shooter_velocity[0] * dt,
+            position[1] + shooter_velocity[1] * dt,
+            position[2] + height + shooter_velocity[2] * dt,
+        )
         target = enemy["pos"]
         velocity = enemy.get("vel", (0, 0, 0))
         target_vel = [velocity[i] for i in range(3)]
@@ -582,7 +595,7 @@ class Pilot:
             stats = weapon["stats"]
             if not me["stats"]["min_pitch"] <= pitch <= me["stats"]["max_pitch"]:
                 continue
-            weight = {"gun": 25, "mortar": 54, "laser": 74, "lightning": 55}[kind]
+            weight = {"gun": 25, "mortar": 54, "laser": 74, "lightning": 67}[kind]
             cooldown = weapon.get("cooldown", 0)
             if kind == "gun" and (weapon.get("reload", 0) > .08 or weapon.get("ammo", 1) == 0):
                 weight -= 35
@@ -604,23 +617,37 @@ class Pilot:
             aim = self.direct_aim(me, enemy)
             action["aim"] = aim
             return
-        _, selected, primary, yaw, pitch, length = max(options, key=lambda option: option[0])
+        _, selected, primary, yaw, pitch, _ = max(options, key=lambda option: option[0])
+        if primary["kind"] == "lightning":
+            cone = math.radians(primary["stats"]["cone_deg"]) * .38
+            for _, _, weapon, gun_yaw, gun_pitch, _ in options:
+                if (
+                    weapon["kind"] == "gun" and weapon.get("ammo", 0) > 0
+                    and weapon.get("reload", 0) <= dt * .5
+                    and weapon.get("cooldown", 0) <= dt
+                    and abs(angle(gun_yaw - yaw)) < cone
+                ):
+                    # The beam has a yaw cone. Aim for the smaller gun window inside it.
+                    yaw, pitch = gun_yaw, gun_pitch
+                    break
         action["aim"] = [yaw, pitch]
         actual_yaw, actual_pitch = me["aim"]
-        interval = dt * (.95 if primary.get("cooldown", 0) > dt * .5 else .49)
-        shift_yaw = me["stats"]["turn_rate"] * interval
-        shift_pitch = me["stats"]["pitch_rate"] * interval
-        yaw_error = max(0, abs(angle(yaw - actual_yaw)) - shift_yaw)
-        pitch_error = max(0, abs(pitch - actual_pitch) - shift_pitch)
-        tolerance = clamp(2.0 / max(length, 1), .012, .29)
-        if enemy.get("kind") is None:
-            tolerance *= .48
         for _, i, w, y, p, d in options:
             kind = w["kind"]
-            aligned = yaw_error < tolerance and pitch_error < tolerance * 1.22
-            same = abs(angle(y - yaw)) < tolerance * .62 and abs(p - pitch) < tolerance * .74
+            interval = dt * (.95 if w.get("cooldown", 0) > dt * .5 else .49)
+            turn = me["stats"]["turn_rate"] * interval
+            tilt = me["stats"]["pitch_rate"] * interval
+            firing_yaw = actual_yaw + clamp(angle(yaw - actual_yaw), -turn, turn)
+            firing_pitch = actual_pitch + clamp(pitch - actual_pitch, -tilt, tilt)
+            tolerance = clamp(2.0 / max(d, 1), .009, .29)
+            if enemy.get("kind") is None:
+                tolerance *= .58
+            yaw_error = abs(angle(y - firing_yaw))
+            pitch_error = abs(p - firing_pitch)
+            aligned = yaw_error < tolerance and pitch_error < tolerance * 1.32
+            same = abs(angle(y - yaw)) < tolerance and abs(p - pitch) < tolerance * 1.2
             if kind == "lightning":
-                lined_up = abs(angle(y - actual_yaw)) < math.radians(w["stats"]["cone_deg"]) * .42
+                lined_up = yaw_error < math.radians(w["stats"]["cone_deg"]) * .43
                 action["fire"][i] = lined_up and me["energy"] > w["stats"]["energy"] + 5
             elif kind == "laser":
                 charge = w.get("charge", 0)
@@ -675,11 +702,18 @@ class Pilot:
             action["take"] = nearby_weapon[1]
             if drop_slot is not None:
                 action["drop"] = drop_slot
+        cube_bins = defaultdict(int)
+        for cube in obs["cubes"]:
+            x, y, _ = cube["pos"]
+            cube_bins[round(x / 7.5), round(y / 7.5)] += 1
         for cube in obs["cubes"]:
             p = cube["pos"]
             d = distance(position, p)
             if d < 95 and distance(p, zone["center"]) < zone["radius"] - 3:
-                options.append((68 - d * .47 - abs(p[2] - position[2]) * .72, p))
+                count = cube_bins[round(p[0] / 7.5), round(p[1] / 7.5)]
+                growth = 10 if me["cubes"] < self.config["cubes"]["stat_cap"] else 0
+                options.append((68 + growth + 9 * min(6, count - 1) - d * .47
+                                - abs(p[2] - position[2]) * .72, p))
         for drop in obs.get("drops", ()):
             p = drop["pos"]
             d = distance(position, p)
@@ -731,8 +765,15 @@ class Pilot:
         retreat = self.recovering and not close_finish
         future, urgent = self.zone_goal(obs, position)
         value, goal = self.loot(obs, me, action, future, bool(threats))
+        capture = next((
+            drop for drop in obs.get("drops", ())
+            if drop["holder"] == me["id"] and drop["lands_in"] <= 0
+            and drop["capture_s"] - drop["progress"] <= 1.35
+        ), None)
         if urgent:
             goal = future
+        elif capture is not None:
+            goal = capture["pos"]
         elif retreat and (threats or now - self.last_damage < 2.5):
             goal = self.escape_goal(obs, me, threats, future)
         elif retreat:
@@ -742,13 +783,18 @@ class Pilot:
             dist = max(1, enemy_distance)
             ux, uy = (enemy_pos[0] - position[0]) / dist, (enemy_pos[1] - position[1]) / dist
             holds_laser, holds_melee = "laser" in held, "lightning" in held
-            desired = 85 if holds_laser else 34 if holds_melee else 51
+            desired = 85 if holds_laser else 30 if holds_melee else 51
+            if holds_melee and me["energy"] < 16:
+                desired = 43
             if any(w == "lightning" for w in target.get("weapons", [])) and not holds_melee:
                 desired = max(desired, 68)
             radial = clamp((dist - desired) / 28, -1, 1)
             radial += .23 * math.sin(now * 3.6 + self.scan_origin)
             side = self.turn_side
-            if dist > 72 and value > (63 if len(held) == 1 else 105) and not close_finish:
+            reward_nearby = value > 88 and distance(position, goal) < 22 and hp_fraction > .40
+            if not close_finish and (
+                reward_nearby or dist > 72 and value > (63 if len(held) == 1 else 105)
+            ):
                 pass  # Equip or repair while the opponent is still at range.
             elif not visible and dist > 30:
                 goal = enemy_pos if value < 55 else goal
@@ -769,7 +815,9 @@ class Pilot:
             span = min(45, obs["zone"]["next_radius"] * .5)
             goal = [future[0] + math.cos(heading) * span, future[1] + math.sin(heading) * span]
 
-        climb = self.perch_route(obs, me, target if engage else None, urgent, retreat, held)
+        climb = self.perch_route(
+            obs, me, target if engage and capture is None and value < 88 else None, urgent, retreat, held
+        )
         if climb is not None:
             goal, _, _ = climb
         elif engage and not urgent and me["grounded"]:
