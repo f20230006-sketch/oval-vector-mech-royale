@@ -211,6 +211,68 @@ class Pilot:
         self.climb = None
         self.climb_started = -100.0
         self.climb_blocked_until = -100.0
+        self.precontact_climb = False
+        self.perched_until = -100.0
+
+    def safe_perch(self, obs, me):
+        """Choose a short ascent with a firing lane into the next circle."""
+        position, stats, zone = me["pos"], me["stats"], obs["zone"]
+        upcoming = zone["next_center"]
+        incoming = math.atan2(upcoming[1] - position[1], upcoming[0] - position[0])
+        if distance(position, upcoming) < 24:
+            incoming = self.scan_origin
+        candidates = []
+        for takeoff, landing in self.map.ledges:
+            approach = distance(position, takeoff)
+            rise = landing[2] - position[2]
+            if not 9 <= rise <= 23 or approach > 31:
+                continue
+            if (distance(landing, zone["center"]) > zone["radius"] - 16
+                    or distance(landing, upcoming) > zone["next_radius"] - 16):
+                continue
+            ascent_energy = stats["jet_drain"] * (rise + 3.5) / stats["max_rise_speed"]
+            if me["energy"] - ascent_energy < 35:
+                continue
+            score = .87 * rise - .48 * approach - .05 * distance(landing, upcoming)
+            candidates.append((score, takeoff, landing))
+        best, selected = 4.0, None
+        for score, takeoff, landing in sorted(candidates, reverse=True)[:10]:
+            floor = self.map.ground(*takeoff)
+            if floor > position[2] + 2 or not self.map.ray(
+                (*position[:2], position[2] + 3), (*takeoff, floor + 3)
+            ):
+                continue
+            radius = stats["radius"]
+            if any(
+                self.map.solid(takeoff[0] + dx, takeoff[1] + dy, floor + .5, landing[2] + stats["height"])
+                for dx, dy in ((0, 0), (radius, 0), (-radius, 0), (0, radius), (0, -radius))
+            ):
+                continue
+            if self.map.solid(*landing[:2], landing[2] + .3, landing[2] + stats["height"]):
+                continue
+            outgoing, protected = 0, 0
+            muzzle = (*landing[:2], landing[2] + stats["muzzle_height"])
+            body = (*landing[:2], landing[2] + stats["height"] * .55)
+            for off in (-1.1, -.55, 0, .55, 1.1):
+                angle_to_lane = incoming + off
+                for span in (46, 73):
+                    x = landing[0] + math.cos(angle_to_lane) * span
+                    y = landing[1] + math.sin(angle_to_lane) * span
+                    if not (self.map.bounds["minX"] < x < self.map.bounds["maxX"]
+                            and self.map.bounds["minY"] < y < self.map.bounds["maxY"]):
+                        continue
+                    if distance((x, y), upcoming) > zone["next_radius"] + 8:
+                        continue
+                    z = self.map.ground(x, y)
+                    if self.map.solid(x, y, z + .5, z + 9):
+                        continue
+                    if self.map.ray(muzzle, (x, y, z + 5)):
+                        outgoing += 1
+                        protected += not self.map.ray((x, y, z + 7), body)
+            score += .85 * outgoing + 2.0 * protected
+            if outgoing >= 4 and score > best:
+                best, selected = score, (takeoff, landing)
+        return selected
 
     def find_perch(self, obs, me, enemy):
         position, zone, stats = me["pos"], obs["zone"], me["stats"]
@@ -243,14 +305,25 @@ class Pilot:
                 best, ledge = score, (takeoff, landing)
         return ledge
 
-    def perch_route(self, obs, me, enemy, urgent, retreat, held):
+    def perch_route(self, obs, me, enemy, urgent, retreat, held, can_prepare):
         """Commit to a short open-air ascent before crossing the roof edge."""
         now = obs["t"]
         position = me["pos"]
-        if urgent or retreat or enemy is None:
+        if urgent or retreat or (enemy is None and not can_prepare and not self.precontact_climb):
             self.climb = None
+            self.precontact_climb = False
             return None
-        if self.climb is None and now >= self.climb_blocked_until:
+        if self.precontact_climb and self.pressure > 70 and position[2] < self.map.ground(*position[:2]) + 4:
+            self.climb = None
+            self.precontact_climb = False
+            self.climb_blocked_until = now + 8
+            return None
+        if self.climb is None and now >= self.climb_blocked_until and can_prepare:
+            self.climb = self.safe_perch(obs, me)
+            self.precontact_climb = self.climb is not None
+            self.climb_started = now
+            self.climb_blocked_until = now + 3.5
+        elif self.climb is None and now >= self.climb_blocked_until and enemy is not None:
             dist = distance(position, enemy["pos"])
             if (
                 not me["grounded"] or not 47 < dist < 130 or me["energy"] < 72
@@ -266,12 +339,16 @@ class Pilot:
         takeoff, landing = self.climb
         if now - self.climb_started > 6 or me["energy"] < 8:
             self.climb = None
+            self.precontact_climb = False
             self.climb_blocked_until = now + 6
             return None
         if position[2] >= landing[2] + .15:
             if distance(position, landing) > 2.5:
                 return landing, False, not me["grounded"] and position[2] < landing[2] + 5
             self.climb = None
+            if self.precontact_climb:
+                self.perched_until = now + 12
+            self.precontact_climb = False
             return None
         if me["grounded"] and distance(position, takeoff) > 3:
             return takeoff, False, False
@@ -862,9 +939,16 @@ class Pilot:
             span = min(45, obs["zone"]["next_radius"] * .5)
             goal = [future[0] + math.cos(heading) * span, future[1] + math.sin(heading) * span]
 
+        can_prepare = (
+            not engage and not threats and not urgent and not retreat and capture is None
+            and value < 42 and me["grounded"] and hp_fraction > .75 and me["energy"] >= 75
+            and ("laser" in held or (now >= 12 and len(held) >= 2 and "lightning" not in held))
+            and now - self.last_damage >= 3 and obs["zone"]["next_radius"] >= 63
+            and position[2] <= self.map.ground(*position[:2]) + 3
+        )
         climb = self.perch_route(
             obs, me, target if engage and not pursue and capture is None and value < 88 else None,
-            urgent, retreat, held
+            urgent, retreat, held, can_prepare
         )
         if climb is not None:
             goal, _, _ = climb
@@ -872,6 +956,9 @@ class Pilot:
             # Keep a roof position while it offers a shot. A descent costs both cover and energy.
             floor = self.map.ground(*position[:2])
             if position[2] > floor + 5 and visible and not retreat and value < 106:
+                goal = position
+        elif not urgent and now < self.perched_until and value < 85:
+            if position[2] > self.map.ground(*position[:2]) + 5:
                 goal = position
 
         movement_goal = goal
@@ -924,6 +1011,9 @@ class Pilot:
         else:
             self.fight(me, None, action, dt)
             heading = math.atan2(move[1], move[0]) if math.hypot(*move) > .2 else self.scan_origin
+            if now < self.perched_until and distance(position, obs["zone"]["next_center"]) >= 24:
+                center = obs["zone"]["next_center"]
+                heading = math.atan2(center[1] - position[1], center[0] - position[0])
             if self.last_bearing is not None and now - self.contact < 1.5:
                 heading = self.last_bearing
             elif sounds := [sound for sound in obs.get("sounds", ())
