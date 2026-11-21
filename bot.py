@@ -203,6 +203,8 @@ class Pilot:
         self.last_attacker = None
         self.last_damage = -100.0
         self.recovering = False
+        self.recovery_goal = None
+        self.recovery_route_until = -100.0
         self.pressure = 0.0
         self.contacts = {}
         self.loot_memory = {}
@@ -360,6 +362,22 @@ class Pilot:
             if score > best:
                 best, result = score, end[:2]
         return result
+
+    def recovery_destination(self, obs, me, threats, zone_goal):
+        position = me["pos"]
+        torso = (*position[:2], position[2] + me["stats"]["height"] * .54)
+        exposed = any(
+            self.map.ray((*source[:2], source[2] + self.config["mech"]["muzzle_height"]), torso)
+            for _, source in threats
+        )
+        now = obs["t"]
+        if exposed or now - self.last_damage < 2:
+            if self.recovery_goal is None or now >= self.recovery_route_until:
+                self.recovery_goal = self.escape_goal(obs, me, threats, zone_goal)
+                self.recovery_route_until = now + .8
+            return self.recovery_goal
+        self.recovery_goal = None
+        return None
 
     def zone_goal(self, obs, position):
         zone, now = obs["zone"], obs["t"]
@@ -763,6 +781,7 @@ class Pilot:
         )
         if hp_fraction >= .75 or (now - self.last_damage > 8 and hp_fraction >= .55):
             self.recovering = False
+            self.recovery_goal = None
         elif outmatched and (threats or now - self.last_damage < 2.5):
             self.recovering = True
         retreat = self.recovering and not close_finish
@@ -778,12 +797,11 @@ class Pilot:
         elif capture is not None:
             goal = capture["pos"]
         elif retreat:
-            if threats or now - self.last_damage < 3.0:
-                goal = self.escape_goal(obs, me, threats, future)
-            elif value > 60:
-                goal = goal
-            else:
-                goal = future
+            destination = self.recovery_destination(obs, me, threats, future)
+            if destination is not None:
+                goal = destination
+            elif value < 70 or distance(position, goal) > 8:
+                goal = position
         elif engage:
             enemy_pos = target["pos"]
             dist = max(1, enemy_distance)
@@ -873,14 +891,12 @@ class Pilot:
                     action["move"] = self.previous_move = [dx / span, dy / span]
 
         if retreat:
-            if target is not None and visible:
-                self.fight(me, target, action, dt)
-            else:
-                self.fight(me, None, action, dt)
-                if target is not None and engage:
-                    action["aim"] = self.direct_aim(me, target)
-                elif self.last_bearing is not None and now - self.last_damage < 3:
-                    action["aim"] = [self.last_bearing, 0.]
+            # Hits we deal reset the same repair timer as hits we receive.
+            self.fight(me, None, action, dt)
+            if target is not None and engage:
+                action["aim"] = self.direct_aim(me, target)
+            elif self.last_bearing is not None and now - self.last_damage < 3:
+                action["aim"] = [self.last_bearing, 0.]
         elif target is not None:
             self.fight(me, target, action, dt)
         else:
