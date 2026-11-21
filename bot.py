@@ -14,11 +14,12 @@ from mechfight import run
 TAU = math.tau
 PICKUP_VALUES = {"gun": 0, "mortar": 1, "lightning": 3, "laser": 5}
 UPGRADE_VALUES = {
-    "laser_charge": 12, "laser_damage": 11, "plating": 10, "nanites": 9.5,
-    "armor": 9, "servos": 8.5, "gun_mag": 8, "gun_damage": 7,
-    "gun_rate": 6, "reactor": 6, "lightning_range": 6, "jets": 5.5,
-    "lightning_efficiency": 5, "gyros": 4, "capacitor": 4,
-    "gun_velocity": 3, "mortar_reload": 2, "sensors": 2,
+    "laser_charge": 12, "laser_damage": 11, "nanites": 11, "plating": 10,
+    "armor": 9, "servos": 8.5, "gun_mag": 8, "gun_damage": 7.5,
+    "gun_rate": 7, "gun_velocity": 7, "lightning_range": 7, "reactor": 6,
+    "jets": 6, "lightning_efficiency": 6, "mortar_velocity": 5,
+    "mortar_splash": 4.5, "mortar_reload": 4, "gyros": 4,
+    "capacitor": 4, "sensors": 3,
 }
 
 
@@ -180,6 +181,98 @@ class Pilot:
         self.waypoint = None
         self.route_goal = None
         self.route_tick = -100
+        self.last_attacker = None
+        self.last_damage = -100.0
+        self.recovering = False
+        self.pressure = 0.0
+        self.contacts = {}
+        self.loot_memory = {}
+
+    def observe(self, obs, me):
+        now = obs["t"]
+        self.pressure *= .94
+        visible = {}
+        for enemy in obs["mechs"]:
+            if enemy["kind"] == "mech":
+                self.contacts[enemy["id"]] = (now, enemy)
+                visible[enemy["id"]] = enemy
+        for event in obs["events"]:
+            kind = event["type"]
+            if kind == "kill":
+                self.contacts.pop(event["target"], None)
+            elif kind == "damaged" and event.get("weapon") != "zone":
+                self.contact = self.last_damage = now
+                self.pressure += event["amount"]
+                if event.get("by") is not None:
+                    self.last_attacker = event["by"]
+                if event.get("bearing") is not None:
+                    self.last_bearing = event["bearing"]
+            elif kind == "hit":
+                self.contact = now
+
+        position = me["pos"]
+        threats = []
+        for seen, enemy in self.contacts.values():
+            age = now - seen
+            if age > 3.5:
+                continue
+            pos = enemy["pos"]
+            if enemy["id"] not in visible:
+                dx, dy, _ = enemy.get("vel", (0, 0, 0))
+                pos = [pos[0] + dx * min(age, .8), pos[1] + dy * min(age, .8), pos[2]]
+            dist = distance(position, pos)
+            if dist > 185:
+                continue
+            bearing = math.atan2(position[1] - pos[1], position[0] - pos[0])
+            facing = abs(angle(bearing - enemy.get("aim", (bearing, 0))[0]))
+            weight = max(0, 1.35 - dist / 150) * (1 if facing < .78 else .47)
+            if enemy.get("charging"):
+                weight += .30
+            if "lightning" in enemy.get("weapons", ()) and dist < 54:
+                weight += .40
+            if enemy["id"] == self.last_attacker and now - self.last_damage < 2.0:
+                weight += .60
+            weight *= max(.25, 1 - age * .32)
+            if weight > .18:
+                threats.append((weight, pos))
+
+        self.contacts = {key: pair for key, pair in self.contacts.items() if now - pair[0] <= 3.5}
+        threats.sort(reverse=True, key=lambda item: item[0])
+        return threats[:4]
+
+    def escape_goal(self, obs, me, threats, zone_goal):
+        position, stats, zone = me["pos"], me["stats"], obs["zone"]
+        if threats:
+            origin = threats[0][1]
+            heading = math.atan2(position[1] - origin[1], position[0] - origin[0])
+        elif self.last_bearing is not None:
+            heading = self.last_bearing + math.pi
+        else:
+            return zone_goal
+
+        origin_zone = distance(position, zone["center"])
+        result = zone_goal
+        best = -math.inf
+        for offset in (0, .35, -.35, .7, -.7, 1.15, -1.15, 1.65, -1.65, 2.2, -2.2):
+            direction = heading + offset
+            dx, dy = math.cos(direction), math.sin(direction)
+            clearance = self.map.clearance(position, dx, dy, stats["radius"], stats["height"], 22)
+            if clearance < 5:
+                continue
+            travel = min(23, clearance)
+            x, y = position[0] + dx * travel, position[1] + dy * travel
+            end = (x, y, self.map.ground(x, y) + stats["height"] * .54)
+            score = 4 * math.cos(offset) + .16 * travel
+            score += .75 * (dx * self.previous_move[0] + dy * self.previous_move[1])
+            score -= max(0, distance(end, zone["center"]) - max(origin_zone, zone["radius"] - 5)) * 2
+            for threat, source in threats[:3]:
+                muzzle = (*source[:2], source[2] + self.config["mech"]["muzzle_height"])
+                separation = distance(end, source) - distance(position, source)
+                score += threat * (clamp(separation * .21, -5, 4) +
+                                   (5 if not self.map.ray(muzzle, end) else 0))
+            if score > best:
+                best, result = score, end[:2]
+        return result
 
     def zone_goal(self, obs, position):
         zone, now = obs["zone"], obs["t"]
@@ -290,6 +383,9 @@ class Pilot:
     def target(self, obs, me):
         position = me["pos"]
         muzzle = (*position[:2], position[2] + me["stats"]["muzzle_height"])
+        effective_range = max((
+            weapon["stats"].get("range", 150) for weapon in me["weapons"] if weapon
+        ), default=0)
         rivals = []
         for enemy in obs["mechs"]:
             dist = distance(position, enemy["pos"])
@@ -300,9 +396,17 @@ class Pilot:
                 score = 35 - .3 * dist
             else:
                 fraction = enemy.get("hp", 1400) / max(1, enemy.get("max_hp", 1400))
-                score = 93 - .30 * dist + 23 * (1 - fraction)
+                bearing = math.atan2(enemy["pos"][1] - position[1], enemy["pos"][0] - position[0])
+                turn = abs(angle(bearing - me["aim"][0]))
+                score = 87 - .36 * dist + 44 * (1 - fraction) - 7 * turn
+                if dist > effective_range or (dist > 115 and fraction > .55):
+                    score -= 28
                 if enemy.get("charging"):
-                    score += 9
+                    score += 5
+                if enemy["id"] == self.last_attacker and obs["t"] - self.last_damage < 1.6:
+                    score += 17
+                if .0 < fraction < .20:
+                    score += 14
                 if enemy["id"] == self.target_id:
                     score += 8
             rivals.append((score, enemy))
@@ -391,7 +495,7 @@ class Pilot:
             if kind == "gun" and (weapon.get("reload", 0) > .08 or weapon.get("ammo", 1) == 0):
                 weight -= 35
             if kind == "mortar":
-                weight -= max(0, length - 58) * .34
+                weight -= max(0, length - 58) * .27
             if kind == "lightning" and me["energy"] <= stats["energy"] + 4:
                 weight -= 60
             if kind == "laser" and (charge := weapon.get("charge", 0)) > 0:
@@ -411,8 +515,9 @@ class Pilot:
         _, selected, primary, yaw, pitch, length = max(options, key=lambda option: option[0])
         action["aim"] = [yaw, pitch]
         actual_yaw, actual_pitch = me["aim"]
-        shift_yaw = me["stats"]["turn_rate"] * dt * .45
-        shift_pitch = me["stats"]["pitch_rate"] * dt * .45
+        interval = dt * (.95 if primary.get("cooldown", 0) > dt * .5 else .49)
+        shift_yaw = me["stats"]["turn_rate"] * interval
+        shift_pitch = me["stats"]["pitch_rate"] * interval
         yaw_error = max(0, abs(angle(yaw - actual_yaw)) - shift_yaw)
         pitch_error = max(0, abs(pitch - actual_pitch) - shift_pitch)
         tolerance = clamp(2.0 / max(length, 1), .012, .29)
@@ -443,28 +548,41 @@ class Pilot:
     def loot(self, obs, me, action, zone_goal, danger):
         position, zone = me["pos"], obs["zone"]
         options = []
+        now = obs["t"]
+        self.loot_memory.update((item["id"], (now, item)) for item in obs["pickups"])
+        for key, (seen, item) in list(self.loot_memory.items()):
+            if now - seen > 12 or (
+                now != seen and distance(position, item["pos"]) < 6
+                and abs(position[2] - item["pos"][2]) < 4
+            ):
+                del self.loot_memory[key]
         held = [w["kind"] if w else None for w in me["weapons"]]
         drop_slot = None
         if None not in held:
             secondary = 1 if held[0] == "gun" else 0
             drop_slot = secondary
         old_value = PICKUP_VALUES.get(held[drop_slot], 0) if drop_slot is not None else 0
-        for pickup in obs["pickups"]:
+        nearby_weapon = None
+        for seen, pickup in self.loot_memory.values():
             kind = pickup["kind"]
             value = PICKUP_VALUES.get(kind, 0)
             if kind in held or value <= old_value:
                 continue
             p = pickup["pos"]
             dist = distance(position, p)
-            if dist < self.config["loot"]["pickup_radius"] * .98 and abs(p[2] - position[2]) < 3.9:
-                action["take"] = pickup["id"]
-                if drop_slot is not None:
-                    action["drop"] = drop_slot
-                break
+            if now == seen and dist < self.config["loot"]["pickup_radius"] * .98 and abs(p[2] - position[2]) < 3.9:
+                if nearby_weapon is None or value > nearby_weapon[0]:
+                    nearby_weapon = value, pickup["id"]
             margin = zone["radius"] - distance(p, zone["center"])
-            score = 35 + 9 * value - dist * .31 - abs(p[2] - position[2]) * .42
+            score = 41 + 9 * value - dist * .33 - abs(p[2] - position[2]) * .60
+            if None in held:
+                score += 16
             if dist < 120 and margin > 6:
-                options.append((score, p))
+                options.append((score - (now - seen) * 1.6, p))
+        if nearby_weapon is not None:
+            action["take"] = nearby_weapon[1]
+            if drop_slot is not None:
+                action["drop"] = drop_slot
         for cube in obs["cubes"]:
             p = cube["pos"]
             d = distance(position, p)
@@ -477,7 +595,8 @@ class Pilot:
                 continue
             if distance(p, zone["center"]) < zone["radius"] - 8:
                 injury = 1 - me["hp"] / me["max_hp"]
-                options.append((90 + 45 * injury - .35 * d, p))
+                committed = drop["holder"] == me["id"]
+                options.append((91 + 78 * injury + 38 * committed - .43 * d, p))
         if not danger:
             for crate in obs["crates"]:
                 p = crate["pos"]
@@ -494,11 +613,7 @@ class Pilot:
         if self.last_pos is not None and math.hypot(*self.previous_move) > .5:
             self.stuck = self.stuck + 1 if distance(position, self.last_pos) < .25 else max(0, self.stuck - 2)
         self.last_pos = position
-        for event in obs["events"]:
-            if event["type"] in ("hit", "damaged") and event.get("weapon") != "zone":
-                self.contact = now
-                if event["type"] == "damaged" and event.get("bearing") is not None:
-                    self.last_bearing = event["bearing"]
+        threats = self.observe(obs, me)
         if offer := obs.get("offer"):
             action["pick"] = max(range(len(offer["choices"])),
                                  key=lambda i: UPGRADE_VALUES.get(offer["choices"][i]["id"], 0))
@@ -506,33 +621,44 @@ class Pilot:
         target, visible = self.target(obs, me)
         engage = target is not None and target.get("kind") == "mech"
         enemy_distance = distance(position, target["pos"]) if engage else math.inf
-        hostile = [e for e in obs["mechs"] if e["kind"] == "mech" and distance(position, e["pos"]) < 115]
         hp_fraction = me["hp"] / me["max_hp"]
         enemy_fraction = target.get("hp", 1400) / max(1, target.get("max_hp", 1400)) if engage else 1
-        retreat = engage and (hp_fraction < .28 or (hp_fraction < .51 and enemy_fraction > hp_fraction * 1.3)
-                              or (hp_fraction < .66 and len(hostile) >= 2))
         held = {w["kind"] for w in me["weapons"] if w}
+        close_finish = engage and visible and enemy_distance < 90 and (
+            target.get("hp", math.inf) <= (95 if "laser" in held else 52)
+        )
+        outmatched = (
+            hp_fraction < .39
+            or hp_fraction < .66 and len(threats) > 1
+            or hp_fraction < .74 and self.pressure > 200 and enemy_fraction > hp_fraction + .18
+        )
+        if hp_fraction >= .88 or (now - self.last_damage > 14 and hp_fraction >= .72):
+            self.recovering = False
+        elif outmatched and (threats or now - self.last_damage < 2):
+            self.recovering = True
+        retreat = self.recovering and not close_finish
         future, urgent = self.zone_goal(obs, position)
-        value, goal = self.loot(obs, me, action, future, bool(hostile))
+        value, goal = self.loot(obs, me, action, future, bool(threats))
         if urgent:
             goal = future
+        elif retreat and (threats or now - self.last_damage < 2.5):
+            goal = self.escape_goal(obs, me, threats, future)
+        elif retreat:
+            goal = goal if value > 100 else position
         elif engage:
             enemy_pos = target["pos"]
             dist = max(1, enemy_distance)
             ux, uy = (enemy_pos[0] - position[0]) / dist, (enemy_pos[1] - position[1]) / dist
             holds_laser, holds_melee = "laser" in held, "lightning" in held
-            desired = 78 if holds_laser else 36 if holds_melee else 52
+            desired = 92 if holds_laser else 34 if holds_melee else 57
             if any(w == "lightning" for w in target.get("weapons", [])) and not holds_melee:
                 desired = max(desired, 68)
             radial = clamp((dist - desired) / 28, -1, 1)
-            if retreat:
-                radial = -1.7
-            else:
-                radial += .27 * math.sin(now * 3.6 + self.scan_origin)
+            radial += .23 * math.sin(now * 3.6 + self.scan_origin)
             side = self.turn_side
-            if dist > 95 and value > 49 and not holds_laser and not retreat:
-                pass  # Arm the mech while the opponent is still at long range.
-            elif not visible and not retreat and dist > 30:
+            if dist > 72 and value > (63 if len(held) == 1 else 105) and not close_finish:
+                pass  # Equip or repair while the opponent is still at range.
+            elif not visible and dist > 30:
                 goal = enemy_pos if value < 55 else goal
             else:
                 goal = [position[0] + 24 * (radial * ux + side * uy),
@@ -552,7 +678,7 @@ class Pilot:
             goal = [future[0] + math.cos(heading) * span, future[1] + math.sin(heading) * span]
 
         movement_goal = goal
-        if (not engage or urgent) and distance(position, goal) > 12 and (
+        if (not engage or urgent or retreat) and distance(position, goal) > 12 and (
             len(goal) == 2 or goal[2] <= position[2] + 2.5
         ) and position[2] < self.map.ground(*position[:2]) + 2:
             if obs["tick"] - self.route_tick >= 12:
@@ -580,9 +706,12 @@ class Pilot:
             roof_ascent = len(goal) > 2 and goal[2] - position[2] > .8
             action["boost"] = energy > 8 and (roof_ascent or jump)
 
-        if retreat and (not visible or enemy_distance > 52 or hp_fraction < .20):
+        if retreat:
             self.fight(me, None, action, dt)
-            action["aim"] = self.direct_aim(me, target)
+            if target is not None and engage:
+                action["aim"] = self.direct_aim(me, target)
+            elif self.last_bearing is not None and now - self.last_damage < 3:
+                action["aim"] = [self.last_bearing, 0.]
         elif target is not None:
             self.fight(me, target, action, dt)
         else:
