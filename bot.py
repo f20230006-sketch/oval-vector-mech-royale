@@ -12,7 +12,7 @@ from mechfight import run
 
 
 TAU = math.tau
-PICKUP_VALUES = {"gun": 0, "mortar": 2, "laser": 4, "lightning": 5}
+PICKUP_VALUES = {"gun": 0, "mortar": 2, "laser": 5, "lightning": 4}
 UPGRADE_VALUES = {
     "nanites": 16, "plating": 15, "armor": 14, "laser_charge": 13,
     "laser_damage": 12.5, "servos": 12, "lightning_range": 11,
@@ -202,6 +202,8 @@ class Pilot:
         self.route_tick = -100
         self.last_attacker = None
         self.last_damage = -100.0
+        self.last_enemy_hit = None
+        self.last_enemy_hit_at = -100.0
         self.recovering = False
         self.pressure = 0.0
         self.contacts = {}
@@ -296,6 +298,9 @@ class Pilot:
                     self.last_bearing = event["bearing"]
             elif kind == "hit":
                 self.contact = now
+                if 0 <= event["target"] < 16:
+                    self.last_enemy_hit = event["target"]
+                    self.last_enemy_hit_at = now
 
         position = me["pos"]
         threats = []
@@ -576,6 +581,16 @@ class Pilot:
             return None
         return math.atan2(dy, dx), pitch, length
 
+    def laser_charge_for_kill(self, me, enemy, stats):
+        cubes = self.config["cubes"]
+        multiplier = 1 + cubes["damage_per_cube"] * min(me["cubes"], cubes["stat_cap"])
+        if "mortar" in enemy.get("weapons", ()):
+            multiplier *= 1 + stats["cookoff"]
+        # Leave a margin for armor. A rear-hit bonus is never assumed.
+        required_fraction = enemy.get("hp", math.inf) / (stats["damage"] * multiplier * .82)
+        charge = stats["charge"] * (required_fraction - stats["min_frac"]) / (1 - stats["min_frac"])
+        return max(stats["min_charge"], charge)
+
     def fight(self, me, enemy, action, dt):
         weapons = me["weapons"]
         laser_charging = any(w and w["kind"] == "laser" and w.get("charge", 0) > 0 for w in weapons)
@@ -584,6 +599,7 @@ class Pilot:
                                    w.get("ammo", 99) < w["stats"]["mag"] * .8 for w in weapons)
             return
         options = []
+        laser_release = {}
         for index, weapon in enumerate(weapons):
             if not weapon:
                 continue
@@ -603,10 +619,16 @@ class Pilot:
                 weight -= max(0, length - 58) * .27
             if kind == "lightning" and me["energy"] <= stats["energy"] + 4:
                 weight -= 60
-            if kind == "laser" and (charge := weapon.get("charge", 0)) > 0:
-                # Use the arm gun while building charge, then prioritize the beam.
-                weight = 18 if charge + dt * 1.7 < stats["charge"] else 140
-            elif cooldown > .05:
+            if kind == "laser":
+                desired = stats["charge"] - dt * .35
+                if enemy.get("kind") == "mech":
+                    desired = min(desired, self.laser_charge_for_kill(me, enemy, stats))
+                laser_release[index] = desired
+                charge = weapon.get("charge", 0)
+                if charge > 0:
+                    # Save the shared aim for the beam just before releasing.
+                    weight = 18 if charge + dt * 1.35 < desired else 140
+            if cooldown > .05:
                 weight -= min(150, cooldown * 180)
             options.append((weight, index, weapon, yaw, pitch, length))
         if not options:
@@ -651,7 +673,7 @@ class Pilot:
                 action["fire"][i] = lined_up and me["energy"] > w["stats"]["energy"] + 5
             elif kind == "laser":
                 charge = w.get("charge", 0)
-                desired = w["stats"]["charge"] - dt * .35
+                desired = laser_release[i]
                 action["fire"][i] = (i == selected and (charge < desired or not aligned)) or (
                     charge > 0 and (not same or not aligned or charge < desired)
                 )
@@ -753,7 +775,13 @@ class Pilot:
         enemy_fraction = target.get("hp", 1400) / max(1, target.get("max_hp", 1400)) if engage else 1
         held = {w["kind"] for w in me["weapons"] if w}
         close_finish = engage and visible and enemy_distance < 90 and (
-            target.get("hp", math.inf) <= (95 if "laser" in held else 52)
+            target.get("hp", math.inf) <= 52
+            or any(
+                w and w["kind"] == "laser"
+                and w.get("charge", 0) >= self.laser_charge_for_kill(me, target, w["stats"])
+                and self.solution(w, me, target, dt * .60) is not None
+                for w in me["weapons"]
+            )
         )
         outmatched = (
             hp_fraction < .38
@@ -767,6 +795,13 @@ class Pilot:
             self.recovering = True
         retreat = self.recovering and not close_finish
         future, urgent = self.zone_goal(obs, position)
+        pursue = (
+            engage and not visible and not retreat and not urgent
+            and hp_fraction >= .65 and 0 < enemy_fraction <= .22
+            and 12 < enemy_distance < 72 and len(threats) <= 1
+            and self.last_enemy_hit == target["id"] and now - self.last_enemy_hit_at <= 2.4
+            and distance(target["pos"], obs["zone"]["center"]) < obs["zone"]["radius"] - 12
+        )
         value, goal = self.loot(obs, me, action, future, bool(threats))
         capture = next((
             drop for drop in obs.get("drops", ())
@@ -784,12 +819,14 @@ class Pilot:
                 goal = goal
             else:
                 goal = future
+        elif pursue:
+            goal = target["pos"][:2]
         elif engage:
             enemy_pos = target["pos"]
             dist = max(1, enemy_distance)
             ux, uy = (enemy_pos[0] - position[0]) / dist, (enemy_pos[1] - position[1]) / dist
             holds_laser, holds_melee = "laser" in held, "lightning" in held
-            desired = 90 if holds_laser else (65 if conservative else 51)
+            desired = 100 if holds_laser else (65 if conservative else 51)
             if holds_melee and not holds_laser:
                 lightning = next(w for w in me["weapons"] if w and w["kind"] == "lightning")
                 # Leave room for strafing and target motion inside the beam's range.
@@ -826,7 +863,8 @@ class Pilot:
             goal = [future[0] + math.cos(heading) * span, future[1] + math.sin(heading) * span]
 
         climb = self.perch_route(
-            obs, me, target if engage and capture is None and value < 88 else None, urgent, retreat, held
+            obs, me, target if engage and not pursue and capture is None and value < 88 else None,
+            urgent, retreat, held
         )
         if climb is not None:
             goal, _, _ = climb
@@ -837,7 +875,7 @@ class Pilot:
                 goal = position
 
         movement_goal = goal
-        if (not engage or urgent or retreat) and distance(position, goal) > 12 and (
+        if (not engage or urgent or retreat or pursue) and distance(position, goal) > 12 and (
             len(goal) == 2 or goal[2] <= position[2] + 2.5
         ) and position[2] < self.map.ground(*position[:2]) + 2:
             if obs["tick"] - self.route_tick >= 12:
