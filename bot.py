@@ -14,11 +14,12 @@ from mechfight import run
 TAU = math.tau
 PICKUP_VALUES = {"gun": 0, "mortar": 2, "laser": 4, "lightning": 5}
 UPGRADE_VALUES = {
-    "nanites": 15, "plating": 14, "armor": 13, "servos": 12, "reactor": 11,
-    "laser_charge": 10.5, "laser_damage": 10, "jets": 9.5, "gun_mag": 8.5,
-    "gun_damage": 8, "gun_rate": 7.5, "gun_velocity": 7, "lightning_range": 7,
-    "lightning_efficiency": 6.5, "mortar_velocity": 5, "mortar_splash": 4.5,
-    "mortar_reload": 4, "gyros": 4, "capacitor": 4, "sensors": 3,
+    "nanites": 16, "plating": 15, "armor": 14, "laser_charge": 13,
+    "laser_damage": 12.5, "servos": 12, "lightning_range": 11,
+    "lightning_efficiency": 10.5, "gun_damage": 10, "reactor": 9.5,
+    "jets": 9, "gun_mag": 8.5, "gun_rate": 8, "gun_velocity": 7.5,
+    "mortar_velocity": 5, "mortar_splash": 4.5, "mortar_reload": 4,
+    "gyros": 4, "capacitor": 4, "sensors": 3,
 }
 
 
@@ -355,7 +356,7 @@ class Pilot:
                 muzzle = (*source[:2], source[2] + self.config["mech"]["muzzle_height"])
                 separation = distance(end, source) - distance(position, source)
                 score += threat * (clamp(separation * .21, -5, 4) +
-                                   (5 if not self.map.ray(muzzle, end) else 0))
+                                   (12 if not self.map.ray(muzzle, end) else 0))
             if score > best:
                 best, result = score, end[:2]
         return result
@@ -694,7 +695,7 @@ class Pilot:
             margin = zone["radius"] - distance(p, zone["center"])
             score = 41 + 9 * value - dist * .33 - abs(p[2] - position[2]) * .60
             if None in held:
-                score += 16
+                score += 65
             if dist < 120 and margin > 6:
                 options.append((score - (now - seen) * 1.6, p))
         if nearby_weapon is not None:
@@ -755,12 +756,12 @@ class Pilot:
             target.get("hp", math.inf) <= (95 if "laser" in held else 52)
         )
         outmatched = (
-            hp_fraction < .50
-            or hp_fraction < .68 and len(threats) > 1
-            or (conservative and (hp_fraction < .75 and enemy_fraction > hp_fraction - .12))
-            or hp_fraction < .60 and self.pressure > 110
+            hp_fraction < .38
+            or (hp_fraction < .60 and len(threats) > 1)
+            or (hp_fraction < .52 and enemy_fraction > hp_fraction + .20)
+            or (hp_fraction < .55 and self.pressure > 180)
         )
-        if hp_fraction >= .80 or (now - self.last_damage > 11 and hp_fraction >= .66):
+        if hp_fraction >= .75 or (now - self.last_damage > 8 and hp_fraction >= .55):
             self.recovering = False
         elif outmatched and (threats or now - self.last_damage < 2.5):
             self.recovering = True
@@ -776,10 +777,13 @@ class Pilot:
             goal = future
         elif capture is not None:
             goal = capture["pos"]
-        elif retreat and (threats or now - self.last_damage < 2.5):
-            goal = self.escape_goal(obs, me, threats, future)
         elif retreat:
-            goal = goal if value > 100 else position
+            if threats or now - self.last_damage < 3.0:
+                goal = self.escape_goal(obs, me, threats, future)
+            elif value > 60:
+                goal = goal
+            else:
+                goal = future
         elif engage:
             enemy_pos = target["pos"]
             dist = max(1, enemy_distance)
@@ -864,14 +868,15 @@ class Pilot:
                 if span > .4:
                     action["move"] = self.previous_move = [dx / span, dy / span]
 
-        if retreat and engage and visible and enemy_distance < 78 and now - self.last_damage < .7:
-            self.fight(me, target, action, dt)
-        elif retreat:
-            self.fight(me, None, action, dt)
-            if target is not None and engage:
-                action["aim"] = self.direct_aim(me, target)
-            elif self.last_bearing is not None and now - self.last_damage < 3:
-                action["aim"] = [self.last_bearing, 0.]
+        if retreat:
+            if target is not None and visible:
+                self.fight(me, target, action, dt)
+            else:
+                self.fight(me, None, action, dt)
+                if target is not None and engage:
+                    action["aim"] = self.direct_aim(me, target)
+                elif self.last_bearing is not None and now - self.last_damage < 3:
+                    action["aim"] = [self.last_bearing, 0.]
         elif target is not None:
             self.fight(me, target, action, dt)
         else:
