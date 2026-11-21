@@ -789,7 +789,11 @@ class Pilot:
             dist = max(1, enemy_distance)
             ux, uy = (enemy_pos[0] - position[0]) / dist, (enemy_pos[1] - position[1]) / dist
             holds_laser, holds_melee = "laser" in held, "lightning" in held
-            desired = 90 if holds_laser else (45 if conservative else 30) if holds_melee else (65 if conservative else 51)
+            desired = 90 if holds_laser else (65 if conservative else 51)
+            if holds_melee and not holds_laser:
+                lightning = next(w for w in me["weapons"] if w and w["kind"] == "lightning")
+                # Leave room for strafing and target motion inside the beam's range.
+                desired = lightning["stats"]["range"] * (.78 if conservative else .67)
             if holds_melee and me["energy"] < 16:
                 desired = 50
             if any(w == "lightning" for w in target.get("weapons", [])) and not holds_melee:
