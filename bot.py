@@ -14,12 +14,11 @@ from mechfight import run
 TAU = math.tau
 PICKUP_VALUES = {"gun": 0, "mortar": 2, "laser": 4, "lightning": 5}
 UPGRADE_VALUES = {
-    "laser_charge": 12, "laser_damage": 11, "nanites": 11, "plating": 10,
-    "armor": 9, "servos": 8.5, "gun_mag": 8, "gun_damage": 7.5,
-    "gun_rate": 7, "gun_velocity": 7, "lightning_range": 7, "reactor": 6,
-    "jets": 6, "lightning_efficiency": 6, "mortar_velocity": 5,
-    "mortar_splash": 4.5, "mortar_reload": 4, "gyros": 4,
-    "capacitor": 4, "sensors": 3,
+    "nanites": 15, "plating": 14, "armor": 13, "servos": 12, "reactor": 11,
+    "laser_charge": 10.5, "laser_damage": 10, "jets": 9.5, "gun_mag": 8.5,
+    "gun_damage": 8, "gun_rate": 7.5, "gun_velocity": 7, "lightning_range": 7,
+    "lightning_efficiency": 6.5, "mortar_velocity": 5, "mortar_splash": 4.5,
+    "mortar_reload": 4, "gyros": 4, "capacitor": 4, "sensors": 3,
 }
 
 
@@ -747,6 +746,8 @@ class Pilot:
         target, visible = self.target(obs, me)
         engage = target is not None and target.get("kind") == "mech"
         enemy_distance = distance(position, target["pos"]) if engage else math.inf
+        alive_count = obs.get("alive", 16)
+        conservative = alive_count > 3
         hp_fraction = me["hp"] / me["max_hp"]
         enemy_fraction = target.get("hp", 1400) / max(1, target.get("max_hp", 1400)) if engage else 1
         held = {w["kind"] for w in me["weapons"] if w}
@@ -754,13 +755,14 @@ class Pilot:
             target.get("hp", math.inf) <= (95 if "laser" in held else 52)
         )
         outmatched = (
-            hp_fraction < .30
-            or hp_fraction < .49 and len(threats) > 1
-            or hp_fraction < .54 and self.pressure > 245 and enemy_fraction > hp_fraction + .21
+            hp_fraction < .50
+            or hp_fraction < .68 and len(threats) > 1
+            or (conservative and (hp_fraction < .75 and enemy_fraction > hp_fraction - .12))
+            or hp_fraction < .60 and self.pressure > 110
         )
         if hp_fraction >= .80 or (now - self.last_damage > 11 and hp_fraction >= .66):
             self.recovering = False
-        elif outmatched and (threats or now - self.last_damage < 2):
+        elif outmatched and (threats or now - self.last_damage < 2.5):
             self.recovering = True
         retreat = self.recovering and not close_finish
         future, urgent = self.zone_goal(obs, position)
@@ -783,21 +785,21 @@ class Pilot:
             dist = max(1, enemy_distance)
             ux, uy = (enemy_pos[0] - position[0]) / dist, (enemy_pos[1] - position[1]) / dist
             holds_laser, holds_melee = "laser" in held, "lightning" in held
-            desired = 85 if holds_laser else 30 if holds_melee else 51
+            desired = 90 if holds_laser else (45 if conservative else 30) if holds_melee else (65 if conservative else 51)
             if holds_melee and me["energy"] < 16:
-                desired = 43
+                desired = 50
             if any(w == "lightning" for w in target.get("weapons", [])) and not holds_melee:
-                desired = max(desired, 68)
+                desired = max(desired, 75)
             radial = clamp((dist - desired) / 28, -1, 1)
             radial += .23 * math.sin(now * 3.6 + self.scan_origin)
             side = self.turn_side
             reward_nearby = value > 88 and distance(position, goal) < 22 and hp_fraction > .40
             if not close_finish and (
-                reward_nearby or dist > 72 and value > (63 if len(held) == 1 else 105)
+                reward_nearby or dist > 60 and value > (50 if len(held) == 1 else 85)
             ):
                 pass  # Equip or repair while the opponent is still at range.
-            elif not visible and dist > 30:
-                goal = enemy_pos if value < 55 else goal
+            elif not visible:
+                goal = goal if value > 25 else future
             else:
                 goal = [position[0] + 24 * (radial * ux + side * uy),
                         position[1] + 24 * (radial * uy - side * ux)]
