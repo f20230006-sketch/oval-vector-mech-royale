@@ -12,6 +12,7 @@ from mechfight import run
 
 
 TAU = math.tau
+DODGE_HORIZON = .68
 PICKUP_VALUES = {"gun": 0, "mortar": 2, "laser": 5, "lightning": 4}
 UPGRADE_VALUES = {
     "nanites": 16, "plating": 15, "armor": 14, "laser_charge": 13,
@@ -389,27 +390,88 @@ class Pilot:
             return goal, False
         return upcoming, False
 
-    def route(self, position, goal, stats, obs, opponent, retreat):
+    def projectile_threats(self, obs, position, speed):
+        me = obs["self"]
+        radius, height = me["stats"]["radius"], me["stats"]["height"]
+        cx, cy, cz = me["vel"]
+        threats = []
+        for projectile in obs["projectiles"]:
+            x, y, z = (p - own for p, own in zip(projectile["pos"], position))
+            vx, vy, vz = projectile["vel"]
+            vx, vy, vz = vx - cx, vy - cy, vz - cz
+            speed_sq = vx * vx + vy * vy
+            approach = clamp(-(x * vx + y * vy) / max(.01, speed_sq), 0, DODGE_HORIZON)
+            miss = math.hypot(x + vx * approach, y + vy * approach)
+            mortar = projectile["kind"] == "mortar"
+            shell = self.config["weapons"]["mortar"]
+            margin = radius + (shell["splash_radius"] if mortar else 1.1)
+            if miss > margin + (speed + math.hypot(cx, cy)) * approach + 2:
+                continue
+            gravity = shell["gravity"] if mortar else 0
+            altitude = z + vz * approach - .5 * gravity * approach * approach
+            padding = shell["splash_radius"] if mortar else 1.1
+            if not -padding - 6 < altitude < height + padding + 6:
+                continue
+            threats.append((miss - margin + 3 * approach, approach, x, y, z, vx, vy, vz,
+                            gravity, margin, padding))
+        threats.sort()
+        return threats[:12]
+
+    @staticmethod
+    def projectile_risk(threats, dx, dy, acceleration, height):
+        """Score the closest trajectory approach while accelerating toward the command."""
+        ramp = math.hypot(dx, dy) / acceleration
+        risk = 0.
+        for _, time, x, y, z, vx, vy, vz, gravity, margin, padding in threats:
+            for _ in range(2):
+                if time < ramp:
+                    fraction = time / ramp
+                    advance = .5 * time * fraction
+                else:
+                    fraction = 1.
+                    advance = time - .5 * ramp
+                rx = x + vx * time - dx * advance
+                ry = y + vy * time - dy * advance
+                rvx, rvy = vx - dx * fraction, vy - dy * fraction
+                time = clamp(time - (rx * rvx + ry * rvy) / max(.01, rvx * rvx + rvy * rvy),
+                             0, DODGE_HORIZON)
+            altitude = z + vz * time - .5 * gravity * time * time
+            if -padding < altitude < height + padding:
+                advance = .5 * time * time / ramp if time < ramp else time - .5 * ramp
+                separation = math.hypot(x + vx * time - dx * advance, y + vy * time - dy * advance)
+                risk += max(0, margin - separation)
+        return risk
+
+    def route(self, position, goal, stats, obs, opponent, retreat, boosting=False):
         dx, dy = goal[0] - position[0], goal[1] - position[1]
         dist = math.hypot(dx, dy)
         goal_yaw = math.atan2(dy, dx)
-        if dist < 1:
+        stationary = dist < 1
+        if stationary and not obs["projectiles"]:
             return [0., 0.], False
         radius, height = stats["radius"], stats["height"]
         zone = obs["zone"]
         zoner = zone["radius"]
         center = zone["center"]
         now_zone = distance(position, center)
-        hostile = [
-            projectile for projectile in obs["projectiles"]
-            if distance(projectile["pos"], position) < 105 and abs(projectile["pos"][2] - position[2]) < 25
-        ][:10]
-        speed = stats["walk_speed"]
+        me = obs["self"]
+        speed = stats["boost_speed"] if boosting and me["grounded"] else stats["walk_speed"]
+        if any(w and w["kind"] == "laser" and w.get("charge", 0) for w in me["weapons"]):
+            speed *= .5
+        cx, cy = me["vel"][:2]
+        acceleration = stats["ground_accel"] if me["grounded"] else stats["air_accel"]
+        hostile = self.projectile_threats(obs, position, speed)
+        if stationary:
+            if self.projectile_risk(hostile, -cx, -cy, acceleration, height) < .1:
+                return [0., 0.], False
+            _, _, _, _, _, vx, vy, *_ = hostile[0]
+            goal_yaw = math.atan2(vy + cy, vx + cx) + math.pi * .5
+        scale = .8 if stationary else min(1., dist / 5)
         best, direction, clearance = -1e9, (0, 0), 0
         for offset in (0, .28, -.28, .60, -.60, 1.03, -1.03, 1.48, -1.48, 2.05, -2.05, math.pi):
             a = goal_yaw + offset
             ux, uy = math.cos(a), math.sin(a)
-            clear = self.map.clearance(position, ux, uy, radius, height, dist)
+            clear = self.map.clearance(position, ux, uy, radius, height, 8 if stationary else dist)
             score = 4.7 * math.cos(offset) + min(16, clear) * .27
             if clear < 4:
                 score -= 10
@@ -433,32 +495,11 @@ class Pilot:
                 alignment = abs(angle(bearing - yaw))
                 if current < 105:
                     score += min(.45, alignment) * 2.3
-            for projectile in hostile:
-                p, v = projectile["pos"], projectile["vel"]
-                rx, ry = p[0] - position[0], p[1] - position[1]
-                cur_x, cur_y = obs["self"]["vel"][:2]
-                vx, vy = v[0] - cur_x, v[1] - cur_y
-                denom = vx * vx + vy * vy
-                hit = -(rx * vx + ry * vy) / max(denom, .01)
-                if not 0 < hit < .67:
-                    continue
-                gravity = self.config["weapons"]["mortar"]["gravity"] if projectile["kind"] == "mortar" else 0
-                height_at_hit = p[2] + v[2] * hit - gravity * hit * hit * .5 - position[2]
-                if -1 < height_at_hit < height + 1:
-                    dvx, dvy = ux * speed - cur_x, uy * speed - cur_y
-                    acceleration = stats["ground_accel"] if obs["self"]["grounded"] else stats["air_accel"]
-                    ramp = min(hit, math.hypot(dvx, dvy) / acceleration)
-                    advance = hit - .5 * ramp
-                    if ramp >= hit:
-                        advance *= min(1, acceleration * hit / max(.01, math.hypot(dvx, dvy)))
-                    closest_x = rx + vx * hit - dvx * advance
-                    closest_y = ry + vy * hit - dvy * advance
-                    intercept_vx, intercept_vy = vx - dvx, vy - dvy
-                    separation = abs(closest_x * intercept_vy - closest_y * intercept_vx) / max(
-                        .01, math.hypot(intercept_vx, intercept_vy)
-                    )
-                    margin = radius + (6 if projectile["kind"] == "mortar" else 1.1)
-                    score -= max(0, margin - separation) * 4.6
+            if hostile:
+                reachable_speed = speed * scale * clamp(clear / 5, 0, 1)
+                risk = self.projectile_risk(hostile, ux * reachable_speed - cx,
+                                            uy * reachable_speed - cy, acceleration, height)
+                score -= risk * 6.2
             if score > best:
                 best, direction, clearance = score, (ux, uy), clear
         jump = False
@@ -469,7 +510,6 @@ class Pilot:
             jump = True
             if self.map.clearance(position, math.cos(goal_yaw), math.sin(goal_yaw), radius, height, dist) > 0:
                 direction = (math.cos(goal_yaw), math.sin(goal_yaw))
-        scale = min(1., dist / 5.0)
         return [direction[0] * scale, direction[1] * scale], jump
 
     def target(self, obs, me):
@@ -890,15 +930,17 @@ class Pilot:
                 self.route_goal = goal
             if self.waypoint and distance(goal, self.route_goal) < 15 and distance(position, self.waypoint) > 2:
                 movement_goal = self.waypoint
-        move, jump = self.route(position, movement_goal, stats, obs, target if engage else None, retreat)
+        energy = me["energy"]
+        run = energy > (14 if urgent or retreat else 57) and (
+            urgent or retreat or (distance(position, goal) > 45 and not engage)
+        )
+        move, jump = self.route(position, movement_goal, stats, obs, target if engage else None, retreat,
+                                boosting=run)
         self.previous_move = move
         action["move"] = move
         action["jump"] = bool(jump and me["grounded"])
-        energy = me["energy"]
         if me["grounded"]:
-            action["boost"] = energy > (14 if urgent or retreat else 57) and (
-                urgent or retreat or (distance(position, goal) > 45 and not engage)
-            ) and math.hypot(*move) > .7
+            action["boost"] = run and math.hypot(*move) > .7
         else:
             roof_ascent = len(goal) > 2 and goal[2] - position[2] > .8
             action["boost"] = energy > 8 and (roof_ascent or jump)
