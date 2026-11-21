@@ -62,6 +62,7 @@ class Arena:
         if sys.byteorder != "little":
             self.terrain.byteswap()
         self.bins = defaultdict(list)
+        self.ledges = []
         for solid in world["prisms"]:
             xs, ys = solid["ring"][::2], solid["ring"][1::2]
             x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
@@ -70,6 +71,24 @@ class Arena:
             for ix in range(math.floor(x0 / 16), math.floor(x1 / 16) + 1):
                 for iy in range(math.floor(y0 / 16), math.floor(y1 / 16) + 1):
                     self.bins[ix, iy].append(item)
+            if solid["kind"] == "building" and 8 <= solid["top"] - solid["base"] <= 30:
+                self.add_ledges(item)
+
+    def add_ledges(self, building):
+        _, _, _, _, _, top, ring, holes = building
+        for x1, y1, x2, y2 in ring:
+            span = math.hypot(x2 - x1, y2 - y1)
+            if span < 13:
+                continue
+            mx, my = (x1 + x2) * .5, (y1 + y2) * .5
+            nx, ny = (y1 - y2) / span, (x2 - x1) / span
+            if not inside(mx + nx, my + ny, ring):
+                nx, ny = -nx, -ny
+            landing = (mx + nx * 5.5, my + ny * 5.5, top)
+            if not inside(*landing[:2], ring) or any(inside(*landing[:2], hole) for hole in holes):
+                continue
+            takeoff = (mx - nx * 7, my - ny * 7)
+            self.ledges.append((takeoff, landing))
 
     def ground(self, x, y):
         gx = clamp(x - self.x0, 0, self.width - 1.001)
@@ -187,6 +206,74 @@ class Pilot:
         self.pressure = 0.0
         self.contacts = {}
         self.loot_memory = {}
+        self.climb = None
+        self.climb_started = -100.0
+        self.climb_blocked_until = -100.0
+
+    def find_perch(self, obs, me, enemy):
+        position, zone, stats = me["pos"], obs["zone"], me["stats"]
+        limit = min(31, max(0, me["energy"] - 25) / stats["jet_drain"] * stats["max_rise_speed"] - 4)
+        target = enemy["pos"]
+        best, ledge = -math.inf, None
+        for takeoff, landing in self.map.ledges:
+            approach = distance(position, takeoff)
+            rise = landing[2] - position[2]
+            separation = distance(landing, target)
+            if (
+                approach > 25 or not 7 < rise < limit or not 36 < separation < 135
+                or distance(landing, zone["center"]) > zone["radius"] - 9
+                or distance(landing, zone["next_center"]) > zone["next_radius"] - 8
+            ):
+                continue
+            low = self.map.ground(*takeoff)
+            if not self.map.ray((*position[:2], position[2] + 4), (*takeoff, low + 4)):
+                continue
+            if self.map.solid(*takeoff, low + .5, landing[2] + stats["height"]):
+                continue
+            if self.map.solid(*landing[:2], landing[2] + .3, landing[2] + stats["height"]):
+                continue
+            muzzle = (*landing[:2], landing[2] + stats["muzzle_height"])
+            aim = (*target[:2], target[2] + self.target_height(enemy))
+            if not self.map.ray(muzzle, aim):
+                continue
+            score = 1.8 * min(18, landing[2] - target[2]) - approach - rise * .34
+            if score > best:
+                best, ledge = score, (takeoff, landing)
+        return ledge
+
+    def perch_route(self, obs, me, enemy, urgent, retreat, held):
+        """Commit to a short open-air ascent before crossing the roof edge."""
+        now = obs["t"]
+        position = me["pos"]
+        if urgent or retreat or enemy is None:
+            self.climb = None
+            return None
+        if self.climb is None and now >= self.climb_blocked_until:
+            dist = distance(position, enemy["pos"])
+            if (
+                not me["grounded"] or not 47 < dist < 130 or me["energy"] < 72
+                or "laser" not in held or len(self.contacts) > 1
+                or self.pressure > 95 or self.map.ground(*position[:2]) + 3 < position[2]
+            ):
+                return None
+            self.climb = self.find_perch(obs, me, enemy)
+            self.climb_started = now
+            self.climb_blocked_until = now + 2
+        if self.climb is None:
+            return None
+        takeoff, landing = self.climb
+        if now - self.climb_started > 6 or me["energy"] < 8:
+            self.climb = None
+            self.climb_blocked_until = now + 6
+            return None
+        if position[2] >= landing[2] + .15:
+            if distance(position, landing) > 2.5:
+                return landing, False, not me["grounded"] and position[2] < landing[2] + 5
+            self.climb = None
+            return None
+        if me["grounded"] and distance(position, takeoff) > 3:
+            return takeoff, False, False
+        return takeoff, me["grounded"], not me["grounded"]
 
     def observe(self, obs, me):
         now = obs["t"]
@@ -393,7 +480,10 @@ class Pilot:
             if dist > 250 or abs(dz) > 85:
                 continue
             if enemy["kind"] == "npc":
-                score = 35 - .3 * dist
+                score = 47 - .33 * dist
+                if me["cubes"] < 6:
+                    score += 8
+                score += 14 * (1 - enemy["hp"] / max(1, enemy["max_hp"]))
             else:
                 fraction = enemy.get("hp", 1400) / max(1, enemy.get("max_hp", 1400))
                 bearing = math.atan2(enemy["pos"][1] - position[1], enemy["pos"][0] - position[0])
@@ -428,7 +518,9 @@ class Pilot:
     def target_height(self, enemy):
         kind = enemy.get("kind")
         if kind == "mech":
-            return self.config["mech"]["height"] * .56 * (1 + .05 * enemy.get("cubes", 0))
+            cubes = self.config["cubes"]
+            growth = cubes["size_per_cube"] * min(cubes["stat_cap"], enemy.get("cubes", 0))
+            return self.config["mech"]["height"] * .56 * (1 + growth)
         if kind == "npc":
             return self.config["npc"]["height"] * .51
         return self.config["crates"]["height"] * .55
@@ -628,11 +720,11 @@ class Pilot:
             target.get("hp", math.inf) <= (95 if "laser" in held else 52)
         )
         outmatched = (
-            hp_fraction < .39
-            or hp_fraction < .66 and len(threats) > 1
-            or hp_fraction < .74 and self.pressure > 200 and enemy_fraction > hp_fraction + .18
+            hp_fraction < .30
+            or hp_fraction < .49 and len(threats) > 1
+            or hp_fraction < .54 and self.pressure > 245 and enemy_fraction > hp_fraction + .21
         )
-        if hp_fraction >= .88 or (now - self.last_damage > 14 and hp_fraction >= .72):
+        if hp_fraction >= .80 or (now - self.last_damage > 11 and hp_fraction >= .66):
             self.recovering = False
         elif outmatched and (threats or now - self.last_damage < 2):
             self.recovering = True
@@ -650,7 +742,7 @@ class Pilot:
             dist = max(1, enemy_distance)
             ux, uy = (enemy_pos[0] - position[0]) / dist, (enemy_pos[1] - position[1]) / dist
             holds_laser, holds_melee = "laser" in held, "lightning" in held
-            desired = 92 if holds_laser else 34 if holds_melee else 57
+            desired = 85 if holds_laser else 34 if holds_melee else 51
             if any(w == "lightning" for w in target.get("weapons", [])) and not holds_melee:
                 desired = max(desired, 68)
             radial = clamp((dist - desired) / 28, -1, 1)
@@ -666,7 +758,7 @@ class Pilot:
         elif target is not None and visible and value < 38:
             # Hold a good loot-farming range and close the pickup distance quickly.
             target_distance = distance(position, target["pos"])
-            desired = 32 if target.get("kind") == "npc" else 18
+            desired = 50 if target.get("kind") == "npc" else 18
             if target_distance > desired:
                 fraction = 1 - desired / max(desired, target_distance)
                 goal = [position[i] + fraction * (target["pos"][i] - position[i]) for i in range(2)]
@@ -676,6 +768,15 @@ class Pilot:
             heading = self.scan_origin + now * .085
             span = min(45, obs["zone"]["next_radius"] * .5)
             goal = [future[0] + math.cos(heading) * span, future[1] + math.sin(heading) * span]
+
+        climb = self.perch_route(obs, me, target if engage else None, urgent, retreat, held)
+        if climb is not None:
+            goal, _, _ = climb
+        elif engage and not urgent and me["grounded"]:
+            # Keep a roof position while it offers a shot. A descent costs both cover and energy.
+            floor = self.map.ground(*position[:2])
+            if position[2] > floor + 5 and visible and not retreat and value < 106:
+                goal = position
 
         movement_goal = goal
         if (not engage or urgent or retreat) and distance(position, goal) > 12 and (
@@ -705,8 +806,17 @@ class Pilot:
         else:
             roof_ascent = len(goal) > 2 and goal[2] - position[2] > .8
             action["boost"] = energy > 8 and (roof_ascent or jump)
+        if climb is not None:
+            _, action["jump"], action["boost"] = climb
+            if isinstance(goal, tuple) and len(goal) == 3 and position[2] >= goal[2] + .15:
+                dx, dy = goal[0] - position[0], goal[1] - position[1]
+                span = math.hypot(dx, dy)
+                if span > .4:
+                    action["move"] = self.previous_move = [dx / span, dy / span]
 
-        if retreat:
+        if retreat and engage and visible and enemy_distance < 78 and now - self.last_damage < .7:
+            self.fight(me, target, action, dt)
+        elif retreat:
             self.fight(me, None, action, dt)
             if target is not None and engage:
                 action["aim"] = self.direct_aim(me, target)
@@ -719,9 +829,17 @@ class Pilot:
             heading = math.atan2(move[1], move[0]) if math.hypot(*move) > .2 else self.scan_origin
             if self.last_bearing is not None and now - self.contact < 1.5:
                 heading = self.last_bearing
+            elif sounds := [sound for sound in obs.get("sounds", ())
+                            if sound["kind"] in ("gun", "mortar", "lightning", "laser")
+                            and sound["dist"] == "near" and sound["age"] < .5]:
+                heading = min(sounds, key=lambda sound: sound["age"])["bearing"]
             else:
                 heading += math.sin(now * 1.47 + self.scan_origin) * .96
             action["aim"] = [angle(heading), .01]
+        if climb is not None:
+            for i, weapon in enumerate(me["weapons"]):
+                if weapon and weapon["kind"] == "laser":
+                    action["fire"][i] = False
         self.target_id = target["id"] if target is not None else None
         return action
 
